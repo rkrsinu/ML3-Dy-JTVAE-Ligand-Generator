@@ -1,0 +1,1 @@
+Run prepare_app_data.py. It will create pair_predictions.csv and app_metadata.json here.
