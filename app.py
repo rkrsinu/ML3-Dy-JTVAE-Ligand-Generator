@@ -3,6 +3,7 @@ import math
 import random
 from pathlib import Path
 import sys
+import tqdm
 
 import numpy as np
 import pandas as pd
