@@ -1,0 +1,6 @@
+streamlit==1.48.1
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.14.1
+rdkit==2024.3.3
+torch==2.7.1
