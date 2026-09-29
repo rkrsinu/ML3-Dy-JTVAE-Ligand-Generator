@@ -1,0 +1,13 @@
+{
+  "architecture": "PropNet 56-256-256-3 SiLU",
+  "fit_mode": "all_data",
+  "n_rows": 474,
+  "best_train_loss": 0.03437207161914557,
+  "epochs": 500,
+  "seed": 42,
+  "targets": [
+    "Ucal",
+    "Ueff",
+    "tio"
+  ]
+}
