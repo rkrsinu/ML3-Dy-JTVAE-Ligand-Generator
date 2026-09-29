@@ -1,0 +1,12 @@
+{
+  "input_csv": "/mnt/data/build_ml3_final/ML3_JTVAE_FINAL_CLEAN/ML3_Ucal_Ueff_tio_2.csv",
+  "jtvae_root": "/mnt/data/build_ml3_final/JT-VAE-tmcinvdes-main",
+  "input_complexes": 1689,
+  "clean_complexes": 1689,
+  "final_jtvae_compatible_complexes": 1689,
+  "unique_ligands": 474,
+  "valid_ligands": 474,
+  "invalid_ligands": 0,
+  "vocab_size": 33,
+  "fit_mode": "all_data"
+}
