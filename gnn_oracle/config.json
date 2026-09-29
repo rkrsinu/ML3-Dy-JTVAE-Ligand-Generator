@@ -1,0 +1,7 @@
+{
+  "fit_mode": "all_data",
+  "n_rows": 1687,
+  "n_unique_ligands": 474,
+  "epochs_requested": 250,
+  "architecture": "PairGNN hidden=64 embed=64 layers=3"
+}
