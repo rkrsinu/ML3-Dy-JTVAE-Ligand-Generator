@@ -59,12 +59,80 @@ def load_models():
     jt.load_state_dict(torch.load(JT_MODEL / "best_model.pt", map_location="cpu", weights_only=False))
     jt.eval()
 
-    prop = PropNet()
-    prop.load_state_dict(torch.load(LATENT / "property_oracle.pt", map_location="cpu", weights_only=False))
+    # ------------------------------------------------------------
+    # Latent property oracle
+    # ------------------------------------------------------------
+    # The ML3 checkpoint has existed in two formats:
+    #   A) raw state_dict: {"net.0.weight": ..., ...}
+    #   B) wrapped checkpoint: {"model_state_dict": {...}, ...}
+    # The deployment loader must support BOTH formats.
+    prop_ckpt = torch.load(
+        LATENT / "property_oracle.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if isinstance(prop_ckpt, dict) and "model_state_dict" in prop_ckpt:
+        prop_state = prop_ckpt["model_state_dict"]
+    elif isinstance(prop_ckpt, dict):
+        # Raw PyTorch state_dict.
+        prop_state = prop_ckpt
+    else:
+        raise RuntimeError(
+            "property_oracle.pt is neither a PyTorch state_dict nor a "
+            "wrapped checkpoint containing 'model_state_dict'."
+        )
+
+    # The trained ML3 latent representation is 56-dimensional. Prefer the
+    # checkpoint/config value when available, otherwise infer it directly
+    # from net.0.weight.
+    latent_dim = int(
+        prop_ckpt.get("latent_dim", prop_state["net.0.weight"].shape[1])
+        if isinstance(prop_ckpt, dict)
+        else prop_state["net.0.weight"].shape[1]
+    )
+
+    prop = PropNet(d=latent_dim)
+    try:
+        prop.load_state_dict(prop_state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Latent property-oracle architecture does not match "
+            "property_oracle.pt.\n\n"
+            f"Checkpoint keys: {list(prop_state.keys())[:12]}\n"
+            f"Latent dimension inferred: {latent_dim}\n\n"
+            "Do not use partial/random loading."
+        ) from exc
     prop.eval()
-    sc = pd.read_csv(LATENT / "property_scaler.csv")
-    mu = torch.tensor(sc["mean"].values, dtype=torch.float32)
-    sd = torch.tensor(sc["std"].values, dtype=torch.float32)
+
+    # The scaler is part of the trained oracle and is required to convert
+    # standardized oracle outputs back to physical units.
+    scaler_path = LATENT / "property_scaler.csv"
+    if scaler_path.exists():
+        sc = pd.read_csv(scaler_path)
+        required_scaler_cols = {"mean", "std"}
+        if not required_scaler_cols.issubset(sc.columns):
+            raise RuntimeError(
+                "property_scaler.csv must contain 'mean' and 'std' columns."
+            )
+        mu = torch.tensor(sc["mean"].values, dtype=torch.float32)
+        sd = torch.tensor(sc["std"].values, dtype=torch.float32)
+    elif isinstance(prop_ckpt, dict) and {"target_mean", "target_std"}.issubset(prop_ckpt):
+        mu = torch.tensor(prop_ckpt["target_mean"], dtype=torch.float32).reshape(-1)
+        sd = torch.tensor(prop_ckpt["target_std"], dtype=torch.float32).reshape(-1)
+    else:
+        raise FileNotFoundError(
+            "Neither latent_oracle/property_scaler.csv nor target_mean/target_std "
+            "metadata was found in property_oracle.pt."
+        )
+
+    if len(mu) != 3 or len(sd) != 3:
+        raise RuntimeError(
+            f"Property oracle scaler must contain 3 targets (Ucal, Ueff, tio); "
+            f"found mean={len(mu)}, std={len(sd)}."
+        )
+
+    sd = torch.clamp(sd, min=1e-8)
 
     ck = torch.load(GNN_DIR / "model.pt", map_location="cpu", weights_only=False)
     gc = ck.get("config", {})
