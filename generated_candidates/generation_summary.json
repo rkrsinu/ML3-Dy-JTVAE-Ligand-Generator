@@ -1,0 +1,11 @@
+{
+  "target": {
+    "Ucal": 2000.0,
+    "Ueff": 2200.0,
+    "tio": -11.3
+  },
+  "decoded_unique_novel": 200,
+  "requested": 200,
+  "starts": 1000,
+  "steps": 80
+}
