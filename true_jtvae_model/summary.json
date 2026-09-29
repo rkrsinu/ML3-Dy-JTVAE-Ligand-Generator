@@ -1,6 +1,0 @@
-{
-  "best_val_loss": 10.625168333662318,
-  "epochs_completed": 43,
-  "device": "cpu",
-  "vocab_size": 33
-}
