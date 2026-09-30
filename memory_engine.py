@@ -198,14 +198,11 @@ def max_similarity(smiles, refs):
 
 @dataclass
 class SearchConfig:
-    # User-facing search control is intentionally limited to the number of
-    # memory iterations. The remaining values are fixed to a reproducible
-    # production configuration.
     iterations: int = 4
-    starts_per_iteration: int = 16
-    latent_steps: int = 80
+    starts_per_iteration: int = 12
+    latent_steps: int = 60
     latent_lr: float = 0.06
-    decode_per_seed: int = 4
+    decode_per_seed: int = 3
     latent_noise: float = 0.35
     max_new_ligands: int = 80
     max_memory_ligands: int = 120
@@ -315,14 +312,14 @@ def optimize_latent(seed_z, target_kind, target, prop, mu, sd, steps, lr):
 def encode_ligand_latent(jt, vocab, smiles):
     """Encode one valid ligand to the 56-D JT-VAE mean latent."""
     from fast_jtnn.mol_tree import MolTree
-    from fast_jtnn.datautils_prop import get_tensors, set_batch_nodeID
+    from fast_jtnn.datautils_prop import set_batch_nodeID
+    from fast_jtnn.jtnn_enc import JTNNEncoder
+    from fast_jtnn.mpn import MPN
 
     tree = [MolTree(smiles)]
-    for t in tree:
-        t.recover()
-        t.assemble()
     set_batch_nodeID(tree, vocab)
-    jt_holder, mpn_holder, _ = get_tensors(tree)
+    jt_holder, _ = JTNNEncoder.tensorize(tree)
+    mpn_holder = MPN.tensorize([smiles])
     with torch.no_grad():
         z_mean, _ = jt.encode_latent(jt_holder, mpn_holder)
     return z_mean
@@ -385,67 +382,257 @@ def generate_from_seeds(
     return list(results.values())
 
 
-def pair_screen(candidates, cn_pairs, gnn, gmu, gsd, target_kind, target, max_pairs):
-    """Screen candidate ligand pairs across all training-supported CN pairs.
 
-    CN is not a user-selected restriction. The search evaluates every
-    (CN1, CN2) combination represented in the curated training dataset. This
-    keeps coordination number flexible while avoiding unsupported CN values.
+def _canonical(smiles):
+    return canonicalize(smiles)
+
+
+def build_cn_knowledge(df):
+    """Build ligand- and pair-specific CN knowledge from the training data.
+
+    Priority at inference:
+      1. exact observed ligand pair -> exact observed CN1/CN2
+      2. exact observed ligand in its L1/L2 role -> observed CN values
+      3. novel ligand -> CN inferred from structurally similar training ligands
+      4. no sufficiently similar reference -> do not assign a fabricated CN
+
+    CN is a coordination-environment label from the dataset. It is NOT inferred
+    from donor-atom count and it is NOT allowed to vary over every training CN.
     """
-    smiles = list(dict.fromkeys(candidates))
-    cn_pairs = list(dict.fromkeys((int(a), int(b)) for a, b in cn_pairs))
-    if len(smiles) < 2 or not cn_pairs:
+    role_map = {"L1": {}, "L2": {}}
+    pair_map = {}
+
+    for _, r in df.iterrows():
+        a = _canonical(r["L1"])
+        b = _canonical(r["L2"])
+        if not a or not b:
+            continue
+        try:
+            cn1 = int(round(float(r["CN1"])))
+            cn2 = int(round(float(r["CN2"])))
+        except Exception:
+            continue
+
+        role_map["L1"].setdefault(a, set()).add(cn1)
+        role_map["L2"].setdefault(b, set()).add(cn2)
+
+        # Preserve the experimentally/training-observed pair assignment.
+        pair_map.setdefault((a, b), set()).add((cn1, cn2))
+        # The pair representation is symmetric, so retain the reversed lookup.
+        pair_map.setdefault((b, a), set()).add((cn2, cn1))
+
+    return role_map, pair_map
+
+
+def _morgan_fp(smiles):
+    m = Chem.MolFromSmiles(smiles)
+    if m is None:
+        return None
+    return AllChem.GetMorganFingerprintAsBitVect(m, 2, nBits=1024)
+
+
+def _nearest_cn(smiles, role, role_map, min_similarity=0.45, top_k=5):
+    """Infer CN only from structurally similar ligands observed in training."""
+    fp = _morgan_fp(smiles)
+    if fp is None:
+        return []
+
+    refs = []
+    for ref_smiles, cns in role_map[role].items():
+        rfp = _morgan_fp(ref_smiles)
+        if rfp is None:
+            continue
+        sim = DataStructs.TanimotoSimilarity(fp, rfp)
+        refs.append((sim, ref_smiles, sorted(cns)))
+
+    refs.sort(key=lambda x: x[0], reverse=True)
+    refs = [x for x in refs[:top_k] if x[0] >= min_similarity]
+    if not refs:
+        return []
+
+    # Weighted vote: structurally closer ligands contribute more strongly.
+    votes = {}
+    for sim, _, cns in refs:
+        for cn in cns:
+            votes[cn] = votes.get(cn, 0.0) + sim
+
+    if not votes:
+        return []
+
+    best_score = max(votes.values())
+    # Keep ties, but do not return unrelated CN values.
+    chosen = sorted(cn for cn, score in votes.items()
+                    if score >= 0.95 * best_score)
+
+    return chosen
+
+
+def candidate_cn_values(smiles, role, role_map):
+    """Return only CN values justified by observed data or close analogues."""
+    c = _canonical(smiles)
+    if not c:
+        return [], "invalid"
+
+    if c in role_map[role]:
+        return sorted(role_map[role][c]), "observed_ligand"
+
+    inferred = _nearest_cn(c, role, role_map)
+    if inferred:
+        return inferred, "nearest_neighbor"
+
+    return [], "unassigned"
+
+
+def pair_cn_assignments(a, b, role_map, pair_map):
+    """Return scientifically traceable CN assignments for one ligand pair."""
+    a = _canonical(a)
+    b = _canonical(b)
+    if not a or not b:
+        return []
+
+    # Highest-confidence case: this exact ordered pair occurs in training.
+    exact = pair_map.get((a, b), set())
+    if exact:
+        return [(cn1, cn2, "observed_pair") for cn1, cn2 in sorted(exact)]
+
+    cn1, src1 = candidate_cn_values(a, "L1", role_map)
+    cn2, src2 = candidate_cn_values(b, "L2", role_map)
+
+    if not cn1 or not cn2:
+        return []
+
+    source = (
+        "observed_ligand"
+        if src1 == "observed_ligand" and src2 == "observed_ligand"
+        else "nearest_neighbor"
+        if "nearest_neighbor" in (src1, src2)
+        else "observed_ligand"
+    )
+
+    return [(x, y, source) for x in cn1 for y in cn2]
+
+
+def pair_screen(
+    candidates,
+    df,
+    gnn,
+    gmu,
+    gsd,
+    target_kind,
+    target,
+    max_pairs,
+):
+    """Screen pairs using ligand-specific/observed CN assignments.
+
+    IMPORTANT:
+    The old implementation evaluated every Cartesian product of all training
+    CN values. That is why results such as CN1=1 appeared for ligands whose
+    corresponding dataset entries used a different CN.
+
+    This implementation never assigns an arbitrary CN merely because that CN
+    exists somewhere in the dataset.
+    """
+    smiles = list(dict.fromkeys(_canonical(s) for s in candidates))
+    smiles = [s for s in smiles if s]
+    if len(smiles) < 2:
         return pd.DataFrame()
 
-    base_pairs = list(combinations_with_replacement(smiles, 2))
-    total_possible = len(base_pairs) * len(cn_pairs)
+    role_map, pair_map = build_cn_knowledge(df)
 
-    # Deterministic subsampling if the full Cartesian product is too large.
-    if total_possible > max_pairs:
-        rng = random.Random(42)
-        rng.shuffle(base_pairs)
-        keep = max(1, max_pairs // len(cn_pairs))
-        base_pairs = base_pairs[:keep]
+    pair_list = list(combinations_with_replacement(smiles, 2))
+    if len(pair_list) > max_pairs:
+        random.Random(123).shuffle(pair_list)
+        pair_list = pair_list[:max_pairs]
 
     rows = []
-    for cn1, cn2 in cn_pairs:
-        for start in range(0, len(base_pairs), 256):
-            chunk = base_pairs[start:start + 256]
-            graphs1 = [smiles_graph(a) for a, _ in chunk]
-            graphs2 = [smiles_graph(b) for _, b in chunk]
-            if any(g is None for g in graphs1 + graphs2):
-                continue
-            g1 = BatchGraph(graphs1)
-            g2 = BatchGraph(graphs2)
-            cn = torch.tensor([[cn1, cn2]] * len(chunk), dtype=torch.float32)
-            with torch.no_grad():
-                pred = gnn(g1, g2, cn) * gsd + gmu
-            for (a, b), p in zip(chunk, pred.numpy()):
-                ucal, ueff, tio = map(float, p)
-                tor = tor_from(ueff, tio)
-                raw = [ucal, ueff, tio]
-                rows.append({
-                    "Ligand 1": a,
-                    "Ligand 2": b,
-                    "CN1": cn1,
-                    "CN2": cn2,
-                    "Predicted Ucal (K)": ucal,
-                    "Predicted Ueff (K)": ueff,
-                    "Predicted log10(tau0)": tio,
-                    "Predicted Tor (K)": tor,
-                    "target_error": target_error(raw, target, target_kind),
-                })
+    for start in range(0, len(pair_list), 128):
+        chunk = pair_list[start:start + 128]
+
+        valid_chunks = []
+        assignments = []
+        for a, b in chunk:
+            cn_assign = pair_cn_assignments(a, b, role_map, pair_map)
+            if cn_assign:
+                valid_chunks.append((a, b))
+                assignments.append(cn_assign)
+
+        if not valid_chunks:
+            continue
+
+        graphs1 = [smiles_graph(a) for a, _ in valid_chunks]
+        graphs2 = [smiles_graph(b) for _, b in valid_chunks]
+        if any(g is None for g in graphs1 + graphs2):
+            continue
+
+        g1 = BatchGraph(graphs1)
+        g2 = BatchGraph(graphs2)
+
+        # Encode each ligand once. Only justified CN assignments are then
+        # evaluated by the trained pair head.
+        with torch.no_grad():
+            h1 = gnn.enc(g1)
+            h2 = gnn.enc(g2)
+
+            total = sum(len(x) for x in assignments)
+            h1_rep = torch.cat([
+                h1[i:i+1].repeat(len(assignments[i]), 1)
+                for i in range(len(valid_chunks))
+            ], dim=0)
+            h2_rep = torch.cat([
+                h2[i:i+1].repeat(len(assignments[i]), 1)
+                for i in range(len(valid_chunks))
+            ], dim=0)
+
+            cn_rows = []
+            meta = []
+            for i, assn in enumerate(assignments):
+                for cn1, cn2, cn_source in assn:
+                    cn_rows.append([float(cn1), float(cn2)])
+                    meta.append((i, cn1, cn2, cn_source))
+
+            cn = torch.tensor(cn_rows, dtype=torch.float32)
+            pair_input = torch.cat([h1_rep, h2_rep, cn], dim=1)
+            pred = gnn.f(pair_input) * gsd + gmu
+
+        pred_np = pred.numpy()
+
+        for k, (pair_i, cn1, cn2, cn_source) in enumerate(meta):
+            a, b = valid_chunks[pair_i]
+            ucal, ueff, tio = map(float, pred_np[k])
+            tor = tor_from(ueff, tio)
+            raw = [ucal, ueff, tio]
+
+            rows.append({
+                "Ligand 1": a,
+                "Ligand 2": b,
+                "CN1": int(cn1),
+                "CN2": int(cn2),
+                "CN source": cn_source,
+                "Predicted Ucal (K)": ucal,
+                "Predicted Ueff (K)": ueff,
+                "Predicted log10(tau0)": tio,
+                "Predicted Tor (K)": tor,
+                "target_error": target_error(raw, target, target_kind),
+            })
 
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values("target_error").reset_index(drop=True)
 
+    out = pd.DataFrame(rows)
+
+    # If the same ligand pair has multiple justified assignments, retain the
+    # assignment that best matches the requested target.
+    return (
+        out.sort_values("target_error")
+        .drop_duplicates(subset=["Ligand 1", "Ligand 2"], keep="first")
+        .reset_index(drop=True)
+    )
 
 def run_iterative_search(
-    models, target_kind, target, cn_pairs, cfg: SearchConfig,
+    models, target_kind, target, cfg: SearchConfig,
     initial_ligands, progress=None,
 ):
-    jt, vocab, prop, mu, sd, gnn, gmu, gsd, known, _df, _cn_pairs = models
+    jt, vocab, prop, mu, sd, gnn, gmu, gsd, known, _df = models
     archive = MemoryArchive()
     memory_seed_smiles = list(dict.fromkeys(initial_ligands))
     all_generated = []
@@ -461,13 +648,12 @@ def run_iterative_search(
 
         if generated:
             gen_df = pd.DataFrame(generated)
-
-            # Adaptive steric diversification is automatic. The allowed
-            # substitutions are selected from each ligand's size and available
-            # C-H sites; the experimental library is never modified.
+            # Steric augmentation is automatic and ligand-dependent. The
+            # augmentation module chooses chemically appropriate alkyl groups
+            # from the available C-H sites and molecular size. The experimental
+            # library itself is never modified.
             variants = augment_ligand_pool(
                 gen_df["smiles"].tolist(),
-                labels=None,
                 max_variants_per_parent=cfg.steric_variants_per_parent,
             )
             if variants:
@@ -477,10 +663,11 @@ def run_iterative_search(
                 var_df["memory_score"] = np.nan
                 var_df["selected"] = False
                 gen_df = pd.concat([gen_df, var_df], ignore_index=True, sort=False)
-
             archive.add_ligands(gen_df)
             all_generated.extend(gen_df["smiles"].tolist())
 
+        # Search memory + new molecules. Keep the pool bounded by target-relevant
+        # memory first, then fresh generated molecules.
         pool = list(dict.fromkeys(
             memory_seed_smiles + all_generated[-cfg.max_new_ligands:]
         ))
@@ -490,9 +677,7 @@ def run_iterative_search(
 
         if progress:
             progress(iteration, f"pair screening ({len(pool)} ligands)")
-        pairs = pair_screen(
-            pool, cn_pairs, gnn, gmu, gsd, target_kind, target, cfg.max_pairs
-        )
+        pairs = pair_screen(pool, _df, gnn, gmu, gsd, target_kind, target, cfg.max_pairs)
         if len(pairs):
             pairs["iteration"] = iteration
             pairs["selected"] = False
@@ -500,6 +685,8 @@ def run_iterative_search(
             pairs.loc[:topn - 1, "selected"] = True
             archive.add_pairs(pairs.head(max(cfg.top_pairs_per_iteration * 3, 50)))
 
+            # Memory selection: retain ligands occurring in the best pairs, plus
+            # a small diversity-preserving set of near-target ligands.
             elite = []
             for _, r in pairs.head(cfg.top_pairs_per_iteration).iterrows():
                 elite.extend([r["Ligand 1"], r["Ligand 2"]])
@@ -513,7 +700,7 @@ def run_iterative_search(
 
     if len(archive.pairs):
         final = archive.pairs.sort_values("target_error").drop_duplicates(
-            subset=["Ligand 1", "Ligand 2", "CN1", "CN2"], keep="first"
+            subset=["Ligand 1", "Ligand 2"], keep="first"
         ).reset_index(drop=True)
     else:
         final = pd.DataFrame()

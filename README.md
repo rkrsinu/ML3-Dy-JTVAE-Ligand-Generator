@@ -1,32 +1,15 @@
-# ML3 Memory-Augmented JT-VAE — JACS-ready deployment
+# ML3 Memory-Augmented JT-VAE — corrected CN handling
 
-This deployment is a target-directed ligand-pair generation workflow.
+This version fixes the CN assignment problem.
 
-User controls:
-- Target property: Ueff, Ucal, or Tor
-- Target value
-- Number of memory iterations
+The previous implementation evaluated every Cartesian combination of all CN values in the training set. That could assign an unrelated CN to a ligand.
 
-The following are intentionally hidden from the UI and fixed internally:
-- random seed
-- latent starts
-- latent optimization steps
-- number of decodes
-- number of new ligands per iteration
-- elite-memory size
-- steric-variant count
-- pair-search limit
-- coordination-number inputs
+Corrected priority:
+1. Exact observed ligand pair -> use the dataset's observed CN1/CN2.
+2. Exact known ligand, but unseen pair -> use CN values observed for that ligand in its L1/L2 role.
+3. Novel JT-VAE ligand -> infer CN only from structurally similar training ligands using Morgan similarity and weighted nearest-neighbour voting.
+4. No sufficiently similar reference -> do not invent a CN; exclude the pair from GNN screening.
 
-Workflow:
-1. JT-VAE generates target-directed ligand candidates in latent space.
-2. Generated ligands are automatically diversified when chemically suitable
-   C-H sites are available; the user does not choose substituents.
-3. Ligand pairs are evaluated by the two-ligand GNN across CN1/CN2
-   combinations represented in the training dataset.
-4. Target-ranked elite pairs are stored as memory.
-5. Elite ligands are re-encoded into JT-VAE latent space and used as seeds
-   for the next iteration together with fresh random starts.
-6. Final output is the accumulated target-ranked ligand combinations.
+CN is not inferred from donor-atom count and is not selected merely because that CN exists somewhere in the dataset.
 
-No retraining is required for deployment.
+The GNN still receives CN1 and CN2 exactly as training inputs.
