@@ -198,22 +198,20 @@ def max_similarity(smiles, refs):
 
 @dataclass
 class SearchConfig:
+    # User-facing search control is intentionally limited to the number of
+    # memory iterations. The remaining values are fixed to a reproducible
+    # production configuration.
     iterations: int = 4
-    starts_per_iteration: int = 12
-    latent_steps: int = 60
+    starts_per_iteration: int = 16
+    latent_steps: int = 80
     latent_lr: float = 0.06
-    decode_per_seed: int = 3
+    decode_per_seed: int = 4
     latent_noise: float = 0.35
     max_new_ligands: int = 80
     max_memory_ligands: int = 120
     max_pairs: int = 30000
     top_pairs_per_iteration: int = 20
     steric_variants_per_parent: int = 6
-    use_me: bool = True
-    use_et: bool = True
-    use_npr: bool = False
-    use_ipr: bool = False
-    use_tbu: bool = False
     diversity_weight: float = 0.15
     seed: int = 42
 
@@ -387,49 +385,64 @@ def generate_from_seeds(
     return list(results.values())
 
 
-def pair_screen(candidates, cn1, cn2, gnn, gmu, gsd, target_kind, target, max_pairs):
+def pair_screen(candidates, cn_pairs, gnn, gmu, gsd, target_kind, target, max_pairs):
+    """Screen candidate ligand pairs across all training-supported CN pairs.
+
+    CN is not a user-selected restriction. The search evaluates every
+    (CN1, CN2) combination represented in the curated training dataset. This
+    keeps coordination number flexible while avoiding unsupported CN values.
+    """
     smiles = list(dict.fromkeys(candidates))
-    if len(smiles) < 2:
+    cn_pairs = list(dict.fromkeys((int(a), int(b)) for a, b in cn_pairs))
+    if len(smiles) < 2 or not cn_pairs:
         return pd.DataFrame()
-    pairs = list(combinations_with_replacement(smiles, 2)) if cn1 == cn2 else list(product(smiles, smiles))
-    if len(pairs) > max_pairs:
-        random.Random(123).shuffle(pairs)
-        pairs = pairs[:max_pairs]
+
+    base_pairs = list(combinations_with_replacement(smiles, 2))
+    total_possible = len(base_pairs) * len(cn_pairs)
+
+    # Deterministic subsampling if the full Cartesian product is too large.
+    if total_possible > max_pairs:
+        rng = random.Random(42)
+        rng.shuffle(base_pairs)
+        keep = max(1, max_pairs // len(cn_pairs))
+        base_pairs = base_pairs[:keep]
 
     rows = []
-    for start in range(0, len(pairs), 256):
-        chunk = pairs[start:start + 256]
-        graphs1 = [smiles_graph(a) for a, _ in chunk]
-        graphs2 = [smiles_graph(b) for _, b in chunk]
-        if any(g is None for g in graphs1 + graphs2):
-            continue
-        g1 = BatchGraph(graphs1)
-        g2 = BatchGraph(graphs2)
-        cn = torch.tensor([[cn1, cn2]] * len(chunk), dtype=torch.float32)
-        with torch.no_grad():
-            pred = gnn(g1, g2, cn) * gsd + gmu
-        for (a, b), p in zip(chunk, pred.numpy()):
-            ucal, ueff, tio = map(float, p)
-            tor = tor_from(ueff, tio)
-            raw = [ucal, ueff, tio]
-            rows.append({
-                "Ligand 1": a,
-                "Ligand 2": b,
-                "CN1": cn1,
-                "CN2": cn2,
-                "Predicted Ucal (K)": ucal,
-                "Predicted Ueff (K)": ueff,
-                "Predicted log10(tau0)": tio,
-                "Predicted Tor (K)": tor,
-                "target_error": target_error(raw, target, target_kind),
-            })
+    for cn1, cn2 in cn_pairs:
+        for start in range(0, len(base_pairs), 256):
+            chunk = base_pairs[start:start + 256]
+            graphs1 = [smiles_graph(a) for a, _ in chunk]
+            graphs2 = [smiles_graph(b) for _, b in chunk]
+            if any(g is None for g in graphs1 + graphs2):
+                continue
+            g1 = BatchGraph(graphs1)
+            g2 = BatchGraph(graphs2)
+            cn = torch.tensor([[cn1, cn2]] * len(chunk), dtype=torch.float32)
+            with torch.no_grad():
+                pred = gnn(g1, g2, cn) * gsd + gmu
+            for (a, b), p in zip(chunk, pred.numpy()):
+                ucal, ueff, tio = map(float, p)
+                tor = tor_from(ueff, tio)
+                raw = [ucal, ueff, tio]
+                rows.append({
+                    "Ligand 1": a,
+                    "Ligand 2": b,
+                    "CN1": cn1,
+                    "CN2": cn2,
+                    "Predicted Ucal (K)": ucal,
+                    "Predicted Ueff (K)": ueff,
+                    "Predicted log10(tau0)": tio,
+                    "Predicted Tor (K)": tor,
+                    "target_error": target_error(raw, target, target_kind),
+                })
+
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("target_error").reset_index(drop=True)
 
 
 def run_iterative_search(
-    models, target_kind, target, cn1, cn2, cfg: SearchConfig,
+    models, target_kind, target, cn_pairs, cfg: SearchConfig,
     initial_ligands, progress=None,
 ):
     jt, vocab, prop, mu, sd, gnn, gmu, gsd, known, _df = models
@@ -448,19 +461,15 @@ def run_iterative_search(
 
         if generated:
             gen_df = pd.DataFrame(generated)
-            # Steric augmentation is deliberately applied to generated ligands,
-            # not the original experimental library.
-            labels = []
-            if cfg.use_me: labels.append("Me")
-            if cfg.use_et: labels.append("Et")
-            if cfg.use_npr: labels.append("nPr")
-            if cfg.use_ipr: labels.append("iPr")
-            if cfg.use_tbu: labels.append("tBu")
+
+            # Adaptive steric diversification is automatic. The allowed
+            # substitutions are selected from each ligand's size and available
+            # C-H sites; the experimental library is never modified.
             variants = augment_ligand_pool(
                 gen_df["smiles"].tolist(),
-                labels=labels,
+                labels=None,
                 max_variants_per_parent=cfg.steric_variants_per_parent,
-            ) if labels else []
+            )
             if variants:
                 var_df = pd.DataFrame(variants)
                 var_df["iteration"] = iteration
@@ -468,11 +477,10 @@ def run_iterative_search(
                 var_df["memory_score"] = np.nan
                 var_df["selected"] = False
                 gen_df = pd.concat([gen_df, var_df], ignore_index=True, sort=False)
+
             archive.add_ligands(gen_df)
             all_generated.extend(gen_df["smiles"].tolist())
 
-        # Search memory + new molecules. Keep the pool bounded by target-relevant
-        # memory first, then fresh generated molecules.
         pool = list(dict.fromkeys(
             memory_seed_smiles + all_generated[-cfg.max_new_ligands:]
         ))
@@ -482,7 +490,9 @@ def run_iterative_search(
 
         if progress:
             progress(iteration, f"pair screening ({len(pool)} ligands)")
-        pairs = pair_screen(pool, cn1, cn2, gnn, gmu, gsd, target_kind, target, cfg.max_pairs)
+        pairs = pair_screen(
+            pool, cn_pairs, gnn, gmu, gsd, target_kind, target, cfg.max_pairs
+        )
         if len(pairs):
             pairs["iteration"] = iteration
             pairs["selected"] = False
@@ -490,8 +500,6 @@ def run_iterative_search(
             pairs.loc[:topn - 1, "selected"] = True
             archive.add_pairs(pairs.head(max(cfg.top_pairs_per_iteration * 3, 50)))
 
-            # Memory selection: retain ligands occurring in the best pairs, plus
-            # a small diversity-preserving set of near-target ligands.
             elite = []
             for _, r in pairs.head(cfg.top_pairs_per_iteration).iterrows():
                 elite.extend([r["Ligand 1"], r["Ligand 2"]])

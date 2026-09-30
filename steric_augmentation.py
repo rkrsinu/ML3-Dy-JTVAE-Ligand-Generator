@@ -1,11 +1,9 @@
-"""Chemically constrained ligand augmentation used by the ML3 iterative search.
+"""Adaptive steric diversification for the ML3 memory search.
 
-The original ML3 pair-generation workflow already contained H -> methyl and
-H -> ethyl substitution.  This module preserves those operations and adds
-optional larger alkyl substitutions for extrapolation.
-
-Only carbon-bound hydrogens are substituted.  Products are RDKit-sanitized,
-canonicalized and limited to the <=1-ring ligand space used by the project.
+Steric diversification is automatic.  The user does not select substituents.
+The substitution set is chosen from the parent ligand size and the number of
+available carbon-bound hydrogens, and every product is RDKit-sanitized and
+canonicalized.
 """
 from __future__ import annotations
 
@@ -36,13 +34,54 @@ def passes_ring_rule(smiles: str, max_rings: int = 1) -> bool:
     return mol is not None and rdMolDescriptors.CalcNumRings(mol) <= max_rings
 
 
+def eligible_c_h_sites(smiles: str) -> int:
+    """Number of distinct carbon sites bearing at least one H."""
+    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    return sum(
+        1 for atom in mol.GetAtoms()
+        if atom.GetAtomicNum() == 6
+        and any(n.GetAtomicNum() == 1 for n in atom.GetNeighbors())
+    )
+
+
+def adaptive_labels(smiles: str) -> list[str]:
+    """Choose steric transformations from the ligand itself.
+
+    Small ligands are explored with progressively larger alkyl groups.  Larger
+    ligands are kept to moderate substitutions to avoid uncontrolled growth.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return []
+
+    heavy = mol.GetNumHeavyAtoms()
+    rings = rdMolDescriptors.CalcNumRings(mol)
+    sites = eligible_c_h_sites(smiles)
+
+    if sites == 0:
+        return []
+
+    if heavy <= 12 and rings <= 1:
+        labels = ["Me", "Et", "nPr", "iPr"]
+    elif heavy <= 24:
+        labels = ["Me", "Et", "iPr"]
+    else:
+        labels = ["Me", "Et"]
+
+    # Very crowded parents are not expanded with the largest substituents.
+    if sites <= 1:
+        labels = [x for x in labels if x in {"Me", "Et"}]
+
+    return labels
+
+
 def substitute_one_h(smiles: str, label: str) -> list[str]:
-    """Replace one C-H with the requested alkyl group at every possible site."""
+    """Replace one carbon-bound H with one requested alkyl group."""
     parent = canonicalize(smiles)
     if parent is None or label not in SUBSTITUENTS:
         return []
 
-    fragment, _ = SUBSTITUENTS[label]
+    fragment_smiles, _ = SUBSTITUENTS[label]
     mol_h = Chem.AddHs(Chem.MolFromSmiles(parent))
     products: set[str] = set()
 
@@ -53,46 +92,24 @@ def substitute_one_h(smiles: str, label: str) -> list[str]:
         if not h_neighbors:
             continue
 
-        rw = Chem.RWMol(mol_h)
-        h_idx = h_neighbors[0].GetIdx()
-        anchor_idx = atom.GetIdx()
-        try:
-            rw.RemoveAtom(h_idx)
-            # Removing a hydrogen whose index is lower than the anchor shifts
-            # the anchor index by one.  Re-find the anchor by using the atom's
-            # persistent isotope marker would be cumbersome, so instead mark it
-            # before editing in a fresh copy.
-            # The robust route is to mark the anchor before deletion.
-        except Exception:
-            continue
-
-        # Repeat robustly with an atom-map marker.
         try:
             marked = Chem.RWMol(mol_h)
-            anchor = marked.GetAtomWithIdx(anchor_idx)
-            anchor.SetAtomMapNum(999)
-            marked.RemoveAtom(h_idx)
-            anchor_after = next(a for a in marked.GetAtoms() if a.GetAtomMapNum() == 999)
-            anchor_after.SetAtomMapNum(0)
-            frag = Chem.MolFromSmiles(fragment)
-            frag_idx = marked.AddAtom(Chem.Atom("C"))
-            # Add the fragment explicitly so no dummy atoms or aromaticity
-            # assumptions enter the product.
-            if label == "Me":
-                marked.AddBond(anchor_after.GetIdx(), frag_idx, Chem.BondType.SINGLE)
-            else:
-                # Build the requested alkyl chain/branch from atom SMILES.
-                # The first carbon is attached to the anchor.
-                frag_atoms = [Chem.Atom("C") for _ in range(frag.GetNumAtoms())]
-                # Remove the temporary atom; construct all fragment atoms.
-                marked.RemoveAtom(frag_idx)
-                new_indices = [marked.AddAtom(a) for a in frag_atoms]
-                marked.AddBond(anchor_after.GetIdx(), new_indices[0], Chem.BondType.SINGLE)
-                # Connect according to the fragment topology.
-                for b in frag.GetBonds():
-                    i = new_indices[b.GetBeginAtomIdx()]
-                    j = new_indices[b.GetEndAtomIdx()]
-                    marked.AddBond(i, j, b.GetBondType())
+            anchor_idx = atom.GetIdx()
+            marked.GetAtomWithIdx(anchor_idx).SetAtomMapNum(999)
+            marked.RemoveAtom(h_neighbors[0].GetIdx())
+            anchor = next(a for a in marked.GetAtoms() if a.GetAtomMapNum() == 999)
+            anchor.SetAtomMapNum(0)
+
+            frag = Chem.MolFromSmiles(fragment_smiles)
+            if frag is None:
+                continue
+
+            new_indices = [marked.AddAtom(Chem.Atom(a.GetSymbol())) for a in frag.GetAtoms()]
+            marked.AddBond(anchor.GetIdx(), new_indices[0], Chem.BondType.SINGLE)
+            for b in frag.GetBonds():
+                i = new_indices[b.GetBeginAtomIdx()]
+                j = new_indices[b.GetEndAtomIdx()]
+                marked.AddBond(i, j, b.GetBondType())
 
             product = marked.GetMol()
             Chem.SanitizeMol(product)
@@ -108,12 +125,15 @@ def substitute_one_h(smiles: str, label: str) -> list[str]:
 
 def generate_steric_variants(
     smiles: str,
-    labels: Iterable[str] = ("Me", "Et"),
-    max_variants: int = 12,
+    labels: Iterable[str] | None = None,
+    max_variants: int = 8,
 ) -> list[tuple[str, str]]:
     parent = canonicalize(smiles)
     if parent is None:
         return []
+
+    if labels is None:
+        labels = adaptive_labels(parent)
 
     results: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -129,7 +149,7 @@ def generate_steric_variants(
 
 def augment_ligand_pool(
     smiles_list: Iterable[str],
-    labels: Iterable[str] = ("Me", "Et"),
+    labels: Iterable[str] | None = None,
     max_variants_per_parent: int = 8,
 ) -> list[dict]:
     rows = []
@@ -137,16 +157,17 @@ def augment_ligand_pool(
         p = canonicalize(parent)
         if p is None:
             continue
+        use_labels = list(labels) if labels is not None else adaptive_labels(p)
         for child, label in generate_steric_variants(
-            p, labels=labels, max_variants=max_variants_per_parent
+            p, labels=use_labels, max_variants=max_variants_per_parent
         ):
             rows.append({
                 "smiles": child,
-                "source": f"steric_{label}",
+                "source": f"adaptive_steric_{label}",
                 "parent_smiles": p,
                 "modification": f"H_to_{label}",
             })
-    # Deduplicate while preserving first lineage.
+
     out = {}
     for row in rows:
         out.setdefault(row["smiles"], row)
