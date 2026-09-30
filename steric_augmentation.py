@@ -29,9 +29,15 @@ def canonicalize(smiles: str | None) -> str | None:
     return Chem.MolToSmiles(mol, canonical=True)
 
 
-def passes_ring_rule(smiles: str, max_rings: int = 1) -> bool:
+def passes_ring_rule(smiles: str, max_rings: int | None = None) -> bool:
+    """Validate the generated molecule without imposing a ring-count cutoff.
+
+    Ring count is deliberately not used as a hard filter because the training
+    ligands can contain diverse ring systems. The adaptive rules should control
+    substitution size, not delete chemically valid scaffolds.
+    """
     mol = Chem.MolFromSmiles(smiles)
-    return mol is not None and rdMolDescriptors.CalcNumRings(mol) <= max_rings
+    return mol is not None
 
 
 def eligible_c_h_sites(smiles: str) -> int:

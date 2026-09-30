@@ -315,14 +315,14 @@ def optimize_latent(seed_z, target_kind, target, prop, mu, sd, steps, lr):
 def encode_ligand_latent(jt, vocab, smiles):
     """Encode one valid ligand to the 56-D JT-VAE mean latent."""
     from fast_jtnn.mol_tree import MolTree
-    from fast_jtnn.datautils_prop import set_batch_nodeID
-    from fast_jtnn.jtnn_enc import JTNNEncoder
-    from fast_jtnn.mpn import MPN
+    from fast_jtnn.datautils_prop import get_tensors, set_batch_nodeID
 
     tree = [MolTree(smiles)]
+    for t in tree:
+        t.recover()
+        t.assemble()
     set_batch_nodeID(tree, vocab)
-    jt_holder, _ = JTNNEncoder.tensorize(tree)
-    mpn_holder = MPN.tensorize([smiles])
+    jt_holder, mpn_holder, _ = get_tensors(tree)
     with torch.no_grad():
         z_mean, _ = jt.encode_latent(jt_holder, mpn_holder)
     return z_mean
@@ -445,7 +445,7 @@ def run_iterative_search(
     models, target_kind, target, cn_pairs, cfg: SearchConfig,
     initial_ligands, progress=None,
 ):
-    jt, vocab, prop, mu, sd, gnn, gmu, gsd, known, _df = models
+    jt, vocab, prop, mu, sd, gnn, gmu, gsd, known, _df, _cn_pairs = models
     archive = MemoryArchive()
     memory_seed_smiles = list(dict.fromkeys(initial_ligands))
     all_generated = []

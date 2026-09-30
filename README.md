@@ -1,28 +1,32 @@
-# ML3 Memory-Augmented JT-VAE Target-Directed Ligand Generator
+# ML3 Memory-Augmented JT-VAE — JACS-ready deployment
 
-Final deployment architecture:
+This deployment is a target-directed ligand-pair generation workflow.
 
-`Target -> 56-D JT-VAE latent search -> novel ligand decoding -> H-to-alkyl steric expansion -> two-ligand pair GNN -> elite memory -> next latent iteration`
+User controls:
+- Target property: Ueff, Ucal, or Tor
+- Target value
+- Number of memory iterations
 
-The deployment deliberately does **not** use ExtraTrees/joblib models.
+The following are intentionally hidden from the UI and fixed internally:
+- random seed
+- latent starts
+- latent optimization steps
+- number of decodes
+- number of new ligands per iteration
+- elite-memory size
+- steric-variant count
+- pair-search limit
+- coordination-number inputs
 
-## Runtime
+Workflow:
+1. JT-VAE generates target-directed ligand candidates in latent space.
+2. Generated ligands are automatically diversified when chemically suitable
+   C-H sites are available; the user does not choose substituents.
+3. Ligand pairs are evaluated by the two-ligand GNN across CN1/CN2
+   combinations represented in the training dataset.
+4. Target-ranked elite pairs are stored as memory.
+5. Elite ligands are re-encoded into JT-VAE latent space and used as seeds
+   for the next iteration together with fresh random starts.
+6. Final output is the accumulated target-ranked ligand combinations.
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-The app accepts targets outside the observed dataset range (for example Ueff = 3000 K). Such a request is labelled **EXTRAPOLATION**. The target is used to optimize the continuous JT-VAE latent representation through the separately trained latent property oracle. The decoded ligands are then chemically augmented and screened as L1/L2 pairs by the pair GNN.
-
-## Iterative memory
-
-At every iteration the app stores generated ligands, parent/steric modification, predicted properties, pair combinations and target error. The best pairs become memory. Their ligand SMILES are encoded back into the JT-VAE latent space and reused as seeds in the next iteration, together with fresh random starts.
-
-## Steric modification
-
-Only newly generated JT-VAE ligands are modified. The experimental library is never edited. Supported substitutions are H -> Me, Et, nPr, iPr and tBu.
-
-## Training
-
-`training/` contains the all-data preparation and training scripts. The final deployment fit uses all 1,689 labelled complexes and all 474 unique ligands; no train/test split is used for the deployment fit. Training diagnostics from an independent holdout/CV should be kept separate from deployment fitting.
+No retraining is required for deployment.

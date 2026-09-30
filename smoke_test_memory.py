@@ -15,7 +15,7 @@ cfg=json.loads((BASE/'true_jtvae_model/config.json').read_text())
 vocab=Vocab([x.strip() for x in (BASE/'true_jtvae_vocab.txt').read_text().splitlines() if x.strip()])
 jt=JTNNVAE(vocab,cfg['hidden_size'],cfg['latent_size'],cfg['depthT'],cfg['depthG'])
 jt.load_state_dict(torch.load(BASE/'true_jtvae_model/best_model.pt',map_location='cpu',weights_only=False)); jt.eval()
-prop=PropNet(); _prop_ck = torch.load(BASE/'latent_oracle/property_oracle.pt',map_location='cpu',weights_only=False); prop.load_state_dict(_prop_ck.get('model_state_dict', _prop_ck)); prop.eval()
+prop=PropNet(); prop.load_state_dict(torch.load(BASE/'latent_oracle/property_oracle.pt',map_location='cpu',weights_only=False)); prop.eval()
 ck=torch.load(BASE/'gnn_oracle/model.pt',map_location='cpu',weights_only=False); gc=ck.get('config',{})
 gnn=PairGNN(gc.get('hidden',64),gc.get('embed',64),gc.get('gnn_layers',3)); gnn.load_state_dict(ck['model_state_dict']); gnn.eval()
 smiles='CC1=CC=CC1'
