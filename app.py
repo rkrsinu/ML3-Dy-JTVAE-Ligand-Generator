@@ -199,7 +199,7 @@ except Exception as e:
     st.error(f"Model loading failed: {type(e).__name__}: {e}")
     st.stop()
 
-_, _, _, _, _, _, _, _, known, df = models
+_, _, _, _, _, _, _, _, _, _, known, df = models
 
 with st.sidebar:
     st.header("Target")
