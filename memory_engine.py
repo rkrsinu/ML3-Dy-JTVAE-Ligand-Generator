@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from rdkit import Chem, DataStructs
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdFingerprintGenerator
 
 from steric_augmentation import canonicalize, augment_ligand_pool
 from geometry_model import GeometryAwarePairGNN, batch_graph, load_geometry_model, load_property_model
@@ -422,58 +422,181 @@ def build_cn_map(geometry_df):
         mp.setdefault((b,a),set()).add((int(round(float(r['CN2']))),int(round(float(r['CN1'])))))
     return mp
 
-def pair_fp(s):
-    m=Chem.MolFromSmiles(str(s)); return AllChem.GetMorganFingerprintAsBitVect(m,2,nBits=1024) if m else None
+_MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=1024)
 
-def nearest_cn(a,b,cn_map):
-    fa,fb=pair_fp(a),pair_fp(b)
-    best=None;bestscore=-1.0
-    for (x,y),vals in cn_map.items():
-        fx,fy=pair_fp(x),pair_fp(y)
-        if fx is None or fy is None: continue
+def pair_fp(s):
+    m=Chem.MolFromSmiles(str(s))
+    return _MORGAN_GENERATOR.GetFingerprint(m) if m else None
+
+
+def _make_batch_from_graphs(graphs):
+    """Batch already-parsed molecular graphs without reparsing SMILES."""
+    return BatchGraph(graphs)
+
+
+def _prepare_cn_entries(geometry_df, fp_cache):
+    """Build the observed CN-pair table and fingerprint cache once."""
+    cn_map = build_cn_map(geometry_df)
+    observed = sorted({x for pair in cn_map for x in pair})
+    obs_fp = []
+    for s in observed:
+        fp = fp_cache.get(s)
+        if fp is None and s not in fp_cache:
+            fp = pair_fp(s); fp_cache[s] = fp
+        obs_fp.append(fp)
+    entries=[]
+    for (x,y), vals in cn_map.items():
+        if x in observed and y in observed:
+            entries.append((observed.index(x), observed.index(y), vals))
+    return cn_map, observed, obs_fp, entries
+
+
+def _prepare_candidate_similarity(candidates, observed, observed_fp, fp_cache):
+    """Return candidate-vs-observed Morgan similarities as a dense matrix.
+
+    Only unique candidate ligands are queried.  RDKit computes each row in C,
+    reducing the nearest-CN search from millions of Python/RDKit fingerprint
+    operations to a few tens of thousands of bulk similarities.
+    """
+    mat=[]
+    for s in candidates:
+        fp=fp_cache.get(s)
+        if fp is None and s not in fp_cache:
+            fp=pair_fp(s); fp_cache[s]=fp
+        if fp is None:
+            mat.append(np.zeros(len(observed),dtype=np.float32))
+        else:
+            mat.append(np.asarray(DataStructs.BulkTanimotoSimilarity(fp, observed_fp),dtype=np.float32))
+    return np.vstack(mat) if mat else np.empty((0,len(observed)),dtype=np.float32)
+
+def nearest_cn(a,b,cn_map, fp_cache=None, entries=None):
+    """Find the nearest observed ligand-pair CN environment.
+
+    Fingerprints are precomputed once and then reused.  The numerical
+    nearest-pair criterion is unchanged from the original implementation.
+    """
+    if fp_cache is None:
+        fp_cache = {}
+    if entries is None:
+        entries=[]
+        for (x,y),vals in cn_map.items():
+            fx=fp_cache.get(x)
+            if fx is None and x not in fp_cache: fx=pair_fp(x); fp_cache[x]=fx
+            fy=fp_cache.get(y)
+            if fy is None and y not in fp_cache: fy=pair_fp(y); fp_cache[y]=fy
+            if fx is not None and fy is not None: entries.append((x,y,fx,fy,vals))
+    fa=fp_cache.get(a)
+    if fa is None and a not in fp_cache: fa=pair_fp(a); fp_cache[a]=fa
+    fb=fp_cache.get(b)
+    if fb is None and b not in fp_cache: fb=pair_fp(b); fp_cache[b]=fb
+    if fa is None or fb is None:
+        return None
+    best=None; bestscore=-1.0
+    for x,y,fx,fy,vals in entries:
         score=0.5*(DataStructs.TanimotoSimilarity(fa,fx)+DataStructs.TanimotoSimilarity(fb,fy))
-        if score>bestscore: bestscore=score;best=(next(iter(vals)),score)
+        if score>bestscore:
+            bestscore=score; best=(next(iter(vals)),score)
     return best
+
 
 def valid_single_ligand(s):
     m=Chem.MolFromSmiles(str(s))
     return m is not None and len(Chem.GetMolFrags(m,asMols=False, sanitizeFrags=False))==1
 
-def pair_screen(candidates, geometry_df, geom, gmean, gstd, gnn, gscaler, target_kind, target, max_pairs):
+
+def pair_screen(candidates, geometry_df, geom, gmean, gstd, gnn, gscaler,
+                target_kind, target, max_pairs, progress=None, iteration=None):
     smiles=[]
     for s in candidates:
         c=canonicalize(s)
         if c and valid_single_ligand(c) and c not in smiles: smiles.append(c)
     if len(smiles)<2:return pd.DataFrame()
-    cn_map=build_cn_map(geometry_df)
+
+    # ---- Precompute once per screening call ----
+    fp_cache={}
+    cn_map, observed_ligands, observed_fps, cn_entries = _prepare_cn_entries(geometry_df, fp_cache)
+    candidate_sim=_prepare_candidate_similarity(smiles, observed_ligands, observed_fps, fp_cache)
+    observed_index={s:i for i,s in enumerate(observed_ligands)}
+    # Entry arrays make the nearest-CN lookup fully vectorized.
+    entry_x=np.asarray([e[0] for e in cn_entries],dtype=np.int32)
+    entry_y=np.asarray([e[1] for e in cn_entries],dtype=np.int32)
+    entry_vals=[e[2] for e in cn_entries]
+
+    # Parse each candidate ligand exactly once.  The old implementation called
+    # MolFromSmiles repeatedly for the same ligand in every pair/chunk.
+    graph_cache={s: smiles_graph(s) for s in smiles}
+    ligand_index={s:i for i,s in enumerate(smiles)}
+    all_graphs=_make_batch_from_graphs([graph_cache[s] for s in smiles])
+    with torch.no_grad():
+        # These are the exact encoder outputs used by geom(...) and gnn(...).
+        geom_embeddings=geom.enc(all_graphs)
+        prop_embeddings=gnn.enc(all_graphs)
+
     pair_list=list(combinations_with_replacement(smiles,2))
     if len(pair_list)>max_pairs:
         random.Random(123).shuffle(pair_list);pair_list=pair_list[:max_pairs]
+
     rows=[]
-    for st in range(0,len(pair_list),128):
-        chunk=pair_list[st:st+128]
+    batch_size=512
+    total_batches=(len(pair_list)+batch_size-1)//batch_size
+
+    for bi,st in enumerate(range(0,len(pair_list),batch_size), start=1):
+        chunk=pair_list[st:st+batch_size]
         valid=[]; cnsets=[]
         for a,b in chunk:
-            if (a,b) in cn_map: cns=sorted(cn_map[(a,b)])
+            if (a,b) in cn_map:
+                cns=sorted(cn_map[(a,b)])
             else:
-                near=nearest_cn(a,b,cn_map)
-                cns=[near[0]] if near else []
-            if cns: valid.append((a,b));cnsets.append(cns)
-        if not valid: continue
+                ia=ligand_index[a]
+                ib=ligand_index[b]
+                scores=0.5*(candidate_sim[ia,entry_x]+candidate_sim[ib,entry_y])
+                if len(scores):
+                    j=int(np.argmax(scores))
+                    cns=[next(iter(entry_vals[j]))]
+                else:
+                    cns=[]
+            if cns:
+                valid.append((a,b));cnsets.append(cns)
+
         expanded=[]
         for (a,b),cns in zip(valid,cnsets):
-            for cn1,cn2 in cns: expanded.append((a,b,cn1,cn2))
-        if not expanded: continue
-        a=[x[0] for x in expanded];b=[x[1] for x in expanded]
-        g1=batch_graph(a);g2=batch_graph(b);cn=torch.tensor([[x[2],x[3]] for x in expanded],dtype=torch.float32)
-        with torch.no_grad():
-            gz=geom(g1,g2,cn); geometry=gz*gstd+gmean
-            # normalize geometry exactly as property-model training
-            gm=(geometry-gscaler['geometry_mean'])/gscaler['geometry_std']
-            pred=gnn(g1,g2,cn,gm)*gscaler['target_std']+gscaler['target_mean']
-        for i,(aa,bb,c1,c2) in enumerate(expanded):
-            ll1,ll2,ll,ba=map(float,geometry[i].numpy()); ucal,ueff,tio=map(float,pred[i].numpy()); tor=tor_from(ueff,tio)
-            rows.append({'Ligand 1':aa,'Ligand 2':bb,'CN1':int(c1),'CN2':int(c2),'Predicted LL1 (A)':ll1,'Predicted LL2 (A)':ll2,'Predicted LL (A)':ll,'Predicted BA (deg)':ba,'Predicted Ucal (K)':ucal,'Predicted Ueff (K)':ueff,'Predicted log10(tau0)':tio,'Predicted Tor (K)':tor,'target_error':target_error([ucal,ueff,tio],target,target_kind)})
+            for cn1,cn2 in cns:
+                expanded.append((a,b,cn1,cn2))
+        if expanded:
+            a=[x[0] for x in expanded]; b=[x[1] for x in expanded]
+            cn=torch.tensor([[x[2],x[3]] for x in expanded],dtype=torch.float32)
+
+            # The geometry/property networks share the same pair-level idea,
+            # but their graph encoders are expensive.  Encode each unique
+            # ligand ONCE per screening call, then evaluate only the small
+            # pairwise MLP heads.  This removes thousands of repeated GNN
+            # message-passing operations.
+            idx_a=torch.tensor([ligand_index[x] for x in a],dtype=torch.long)
+            idx_b=torch.tensor([ligand_index[x] for x in b],dtype=torch.long)
+            with torch.no_grad():
+                ge1=geom_embeddings[idx_a]
+                ge2=geom_embeddings[idx_b]
+                gz=geom.h(torch.cat([ge1,ge2,cn],dim=1))
+                geometry=gz*gstd+gmean
+                gm=(geometry-gscaler['geometry_mean'])/gscaler['geometry_std']
+                pe1=prop_embeddings[idx_a]
+                pe2=prop_embeddings[idx_b]
+                pred=gnn.h(torch.cat([pe1,pe2,cn,gm],dim=1))*gscaler['target_std']+gscaler['target_mean']
+            for i,(aa,bb,c1,c2) in enumerate(expanded):
+                ll1,ll2,ll,ba=map(float,geometry[i].numpy())
+                ucal,ueff,tio=map(float,pred[i].numpy())
+                tor=tor_from(ueff,tio)
+                rows.append({
+                    'Ligand 1':aa,'Ligand 2':bb,'CN1':int(c1),'CN2':int(c2),
+                    'Predicted LL1 (A)':ll1,'Predicted LL2 (A)':ll2,
+                    'Predicted LL (A)':ll,'Predicted BA (deg)':ba,
+                    'Predicted Ucal (K)':ucal,'Predicted Ueff (K)':ueff,
+                    'Predicted log10(tau0)':tio,'Predicted Tor (K)':tor,
+                    'target_error':target_error([ucal,ueff,tio],target,target_kind)
+                })
+        if progress and (bi == 1 or bi % 2 == 0 or bi == total_batches):
+            progress(iteration, f"pair screening ({bi}/{total_batches} batches; {len(pair_list)} pairs)")
+
     if not rows:return pd.DataFrame()
     return pd.DataFrame(rows).sort_values('target_error').drop_duplicates(['Ligand 1','Ligand 2'],keep='first').reset_index(drop=True)
 
@@ -526,7 +649,7 @@ def run_iterative_search(
 
         if progress:
             progress(iteration, f"pair screening ({len(pool)} ligands)")
-        pairs = pair_screen(pool, _df, geom, gmean, gstd, gnn, gscaler, target_kind, target, cfg.max_pairs)
+        pairs = pair_screen(pool, _df, geom, gmean, gstd, gnn, gscaler, target_kind, target, cfg.max_pairs, progress=progress, iteration=iteration)
         if len(pairs):
             pairs["iteration"] = iteration
             pairs["selected"] = False
