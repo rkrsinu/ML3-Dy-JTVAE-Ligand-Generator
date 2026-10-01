@@ -439,7 +439,7 @@ def valid_single_ligand(s):
     m=Chem.MolFromSmiles(str(s))
     return m is not None and len(Chem.GetMolFrags(m,asMols=False, sanitizeFrags=False))==1
 
-def pair_screen(candidates, geometry_df, geom, gmean, gstd, gnn, gmu, gsd, target_kind, target, max_pairs):
+def pair_screen(candidates, geometry_df, geom, gmean, gstd, gnn, gscaler, target_kind, target, max_pairs):
     smiles=[]
     for s in candidates:
         c=canonicalize(s)
@@ -469,8 +469,8 @@ def pair_screen(candidates, geometry_df, geom, gmean, gstd, gnn, gmu, gsd, targe
         with torch.no_grad():
             gz=geom(g1,g2,cn); geometry=gz*gstd+gmean
             # normalize geometry exactly as property-model training
-            gm=(geometry-gsd['geometry_mean'])/gsd['geometry_std']
-            pred=gnn(g1,g2,cn,gm)*gsd['target_std']+gsd['target_mean']
+            gm=(geometry-gscaler['geometry_mean'])/gscaler['geometry_std']
+            pred=gnn(g1,g2,cn,gm)*gscaler['target_std']+gscaler['target_mean']
         for i,(aa,bb,c1,c2) in enumerate(expanded):
             ll1,ll2,ll,ba=map(float,geometry[i].numpy()); ucal,ueff,tio=map(float,pred[i].numpy()); tor=tor_from(ueff,tio)
             rows.append({'Ligand 1':aa,'Ligand 2':bb,'CN1':int(c1),'CN2':int(c2),'Predicted LL1 (A)':ll1,'Predicted LL2 (A)':ll2,'Predicted LL (A)':ll,'Predicted BA (deg)':ba,'Predicted Ucal (K)':ucal,'Predicted Ueff (K)':ueff,'Predicted log10(tau0)':tio,'Predicted Tor (K)':tor,'target_error':target_error([ucal,ueff,tio],target,target_kind)})
