@@ -9,7 +9,21 @@ from fast_jtnn.jtmpn import JTMPN
 from fast_jtnn.jtnn_enc import JTNNEncoder
 from fast_jtnn.mpn import MPN
 from fast_jtnn.vocab import Vocab
-from fast_molopt.preprocess_prop import get_mol_trees, load_smiles_and_props_from_files
+
+
+def _get_preprocess_helpers():
+    """Import fast_molopt only when dataset preprocessing is actually used.
+
+    This lazy import breaks the deployment-time circular dependency:
+    fast_jtnn -> datautils_prop -> fast_molopt.preprocess_prop -> fast_jtnn.
+    JT-VAE inference only needs get_tensors/set_batch_nodeID and therefore
+    does not need fast_molopt at import time.
+    """
+    from fast_molopt.preprocess_prop import (
+        get_mol_trees,
+        load_smiles_and_props_from_files,
+    )
+    return get_mol_trees, load_smiles_and_props_from_files
 
 
 class MolTreeDataset(Dataset):
@@ -35,6 +49,7 @@ class MolTreeDataset(Dataset):
         if properties_path:
             print("Detected property file. Loading SMILES and properties")
             # Load SMILES and properties data
+            _, load_smiles_and_props_from_files = _get_preprocess_helpers()
             self.smiles_list, self.properties_array = load_smiles_and_props_from_files(
                 smiles_path, properties_path, developer_mode
             )
@@ -78,7 +93,8 @@ class MolTreeDataset(Dataset):
             start_idx = batch_idx * self.batch_size
             end_idx = min(start_idx + self.batch_size, num_samples)
 
-            mol_trees = get_mol_trees(self.smiles_list[start_idx:end_idx], njobs=1)
+            get_mol_trees, _ = _get_preprocess_helpers()
+            mol_trees = get_mol_trees(self.smiles_list[start_idx:end_idx], njobs=6)
             set_batch_nodeID(mol_trees, self.vocab)
 
             if self.props:
@@ -110,7 +126,7 @@ class MolTreeDataset(Dataset):
 
     def __getitem__(self, idx):
         # Load the entire batch from a single file
-        batch_data = torch.load(self.batch_files[idx], map_location="cpu", weights_only=False)
+        batch_data = torch.load(self.batch_files[idx])
         if self.props:
             return (
                 batch_data["mol_trees"],
@@ -155,20 +171,7 @@ def get_tensors(tree_batch, assm=True, optimize=False):
             cands.extend([(cand, mol_tree.nodes, node) for cand in node.cands])
             batch_idx.extend([i] * len(node.cands))
 
-    if cands:
-        jtmpn_holder = JTMPN.tensorize(cands, mess_dict)
-    else:
-        # Some batches contain only one-node/leaf-only molecules and therefore
-        # have no assembly candidates.  The upstream JTMPN.tensorize() calls
-        # torch.stack([]) in this case.  Represent the empty candidate set
-        # explicitly; JTpropVAE.assm() skips assembly loss for such a batch.
-        jtmpn_holder = (
-            torch.empty((0, JTMPN.ATOM_FDIM), dtype=torch.float32),
-            torch.empty((0, JTMPN.ATOM_FDIM + JTMPN.BOND_FDIM), dtype=torch.float32),
-            torch.empty((0, JTMPN.MAX_NB), dtype=torch.long),
-            torch.empty((0, JTMPN.MAX_NB), dtype=torch.long),
-            [],
-        )
+    jtmpn_holder = JTMPN.tensorize(cands, mess_dict)
     batch_idx = torch.LongTensor(batch_idx)
 
     return (
