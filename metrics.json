@@ -1,0 +1,19 @@
+{
+  "rows": 1579,
+  "unique_pair_cn": 1413,
+  "train_rows": 1255,
+  "test_rows": 324,
+  "geometry_test_MAE": {
+    "LL1_A": 0.07304208474887007,
+    "LL2_A": 0.09494678380893501,
+    "LL_A": 0.12089378000773512,
+    "BA_deg": 7.482142850095287
+  },
+  "property_test_MAE": {
+    "Ucal_K": 196.46891406954168,
+    "Ueff_K": 195.6352632888251,
+    "tio": 0.36356873838328446
+  },
+  "geometry_epochs": 120,
+  "property_epochs": 120
+}

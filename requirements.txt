@@ -2,8 +2,8 @@ streamlit
 numpy
 pandas
 scipy
-scikit-learn
-joblib
 tqdm
-rdkit
+scikit-learn
+openpyxl
+rdkit==2025.09.4
 torch
